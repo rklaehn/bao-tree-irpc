@@ -205,7 +205,7 @@ impl Api {
             },
         };
         let (tx, rx) = self.inner.client_streaming(request, 16).await?;
-        let mut writer = ChunkWriter { tx }.buffered(MAX_CHUNK_BYTES);
+        let mut writer = Buffered::new(ChunkWriter { tx }, MAX_CHUNK_BYTES);
         encode_ranges_validated(data, outboard, &ranges, &mut writer)
             .await
             .context("encoding ranges")?;
@@ -216,7 +216,7 @@ impl Api {
     }
 }
 
-/// Sends each write as one irpc message.
+/// Glue: each write becomes one irpc message.
 struct ChunkWriter {
     tx: mpsc::Sender<Bytes>,
 }
@@ -238,38 +238,23 @@ impl AsyncStreamWriter for ChunkWriter {
     }
 }
 
-trait AsyncStreamWriterExt: AsyncStreamWriter + Sized {
-    fn buffered(self, max: usize) -> BufferedWriter<Self> {
-        BufferedWriter {
-            inner: self,
-            buf: BytesMut::with_capacity(max),
-            max,
-        }
-    }
-}
-
-impl<T: AsyncStreamWriter> AsyncStreamWriterExt for T {}
-
-/// Coalesces writes into frames of at most `max` bytes.
-struct BufferedWriter<W> {
+/// Combinator: coalesce writes into frames of at most `max` bytes.
+struct Buffered<W> {
     inner: W,
     buf: BytesMut,
     max: usize,
 }
 
-impl<W: AsyncStreamWriter> BufferedWriter<W> {
-    async fn flush_buf(&mut self) -> io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
+impl<W: AsyncStreamWriter> Buffered<W> {
+    fn new(inner: W, max: usize) -> Self {
+        Self {
+            inner,
+            buf: BytesMut::with_capacity(max),
+            max,
         }
-        let data = self.buf.split().freeze();
-        self.inner.write_bytes(data).await
     }
-}
 
-impl<W: AsyncStreamWriter> AsyncStreamWriter for BufferedWriter<W> {
-    async fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.buf.extend_from_slice(data);
+    async fn flush_full(&mut self) -> io::Result<()> {
         while self.buf.len() >= self.max {
             let data = self.buf.split_to(self.max).freeze();
             self.inner.write_bytes(data).await?;
@@ -277,22 +262,28 @@ impl<W: AsyncStreamWriter> AsyncStreamWriter for BufferedWriter<W> {
         Ok(())
     }
 
-    async fn write_bytes(&mut self, mut data: Bytes) -> io::Result<()> {
-        if self.buf.is_empty() {
-            while data.len() >= self.max {
-                let chunk = data.split_to(self.max);
-                self.inner.write_bytes(chunk).await?;
-            }
-            if !data.is_empty() {
-                self.buf.extend_from_slice(&data);
-            }
-            return Ok(());
-        }
+    #[cfg(test)]
+    fn into_inner(self) -> W {
+        debug_assert!(self.buf.is_empty());
+        self.inner
+    }
+}
+
+impl<W: AsyncStreamWriter> AsyncStreamWriter for Buffered<W> {
+    async fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        self.buf.extend_from_slice(data);
+        self.flush_full().await
+    }
+
+    async fn write_bytes(&mut self, data: Bytes) -> io::Result<()> {
         self.write(&data).await
     }
 
     async fn sync(&mut self) -> io::Result<()> {
-        self.flush_buf().await?;
+        if !self.buf.is_empty() {
+            let data = self.buf.split().freeze();
+            self.inner.write_bytes(data).await?;
+        }
         self.inner.sync().await
     }
 }
@@ -339,6 +330,41 @@ mod tests {
     use bao_tree::{ByteRanges, io::round_up_to_chunks};
 
     use super::*;
+
+    struct Frames(Vec<Bytes>);
+
+    impl AsyncStreamWriter for Frames {
+        async fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.0.push(Bytes::copy_from_slice(data));
+            Ok(())
+        }
+
+        async fn write_bytes(&mut self, data: Bytes) -> io::Result<()> {
+            self.0.push(data);
+            Ok(())
+        }
+
+        async fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_write_caps_at_max() -> io::Result<()> {
+        let mut w = Buffered::new(Frames(Vec::new()), 4);
+        w.write(&[1, 2, 3, 4, 5, 6, 7]).await?;
+        w.write(&[8, 9]).await?;
+        w.sync().await?;
+        assert_eq!(
+            w.into_inner().0,
+            [
+                Bytes::from_static(&[1, 2, 3, 4]),
+                Bytes::from_static(&[5, 6, 7, 8]),
+                Bytes::from_static(&[9]),
+            ]
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn send_full() -> Result<()> {
