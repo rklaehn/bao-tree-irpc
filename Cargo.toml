@@ -1,0 +1,19 @@
+[package]
+name = "bao-tree-irpc"
+version = "0.1.0"
+edition = "2024"
+description = "Example of sending content-addressed data with bao-tree over irpc"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+bao-tree = { version = "0.16.1", features = ["tokio_fsm", "serde"] }
+bytes = { version = "1", features = ["serde"] }
+iroh-io = "0.6"
+irpc = { version = "0.17", features = ["derive"] }
+n0-future = "0.3"
+range-collections = { version = "0.4.5", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
